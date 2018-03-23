@@ -42,6 +42,7 @@ struct netns_sysctl_ipv6 {
 	int max_hbh_opts_cnt;
 	int max_dst_opts_len;
 	int max_hbh_opts_len;
+	int ip6t_seg6;
 };
 
 struct netns_ipv6 {

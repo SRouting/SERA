@@ -29,6 +29,7 @@
 #include <linux/proc_fs.h>
 #include <linux/err.h>
 #include <linux/cpumask.h>
+#include <net/seg6.h>
 
 #include <linux/netfilter_ipv6/ip6_tables.h>
 #include <linux/netfilter/x_tables.h>
@@ -45,6 +46,85 @@ void *ip6t_alloc_initial_table(const struct xt_table *info)
 }
 EXPORT_SYMBOL_GPL(ip6t_alloc_initial_table);
 
+static inline bool
+mt_seg6_encap(const struct sk_buff *skb, int innoff,
+	      const struct ip6t_ip6 *ip6info)
+{
+	struct ipv6hdr _inner_hdr;
+	const struct ipv6hdr *inner_hdr;
+
+	inner_hdr = skb_header_pointer(skb, innoff,
+				       sizeof(_inner_hdr), &_inner_hdr);
+
+	if (!inner_hdr)
+		return false;
+	if (NF_INVF(ip6info, IP6T_INV_SRCIP,
+		    ipv6_masked_addr_cmp(&inner_hdr->saddr, &ip6info->smsk,
+					 &ip6info->src)) ||
+	    NF_INVF(ip6info, IP6T_INV_DSTIP,
+		    ipv6_masked_addr_cmp(&inner_hdr->daddr, &ip6info->dmsk,
+					 &ip6info->dst)))
+		return false;
+	return true;
+}
+
+static inline bool
+mt_seg6_insert(const struct sk_buff *skb,
+	       int srhoff, const struct ip6t_ip6 *ip6info)
+{
+	int hdrlen;
+	struct in6_addr _daddr;
+	struct ipv6_sr_hdr _srh;
+	const struct in6_addr *daddr;
+	const struct ipv6_sr_hdr *srh;
+
+	srh = skb_header_pointer(skb, srhoff, sizeof(_srh), &_srh);
+	if (!srh)
+		return false;
+	hdrlen = ipv6_optlen(srh);
+	if (skb->len - srhoff < hdrlen)
+		return false;
+	if (srh->type != IPV6_SRCRT_TYPE_4)
+		return false;
+	if (srh->segments_left > srh->first_segment)
+		return false;
+	daddr = skb_header_pointer(skb, srhoff + sizeof(struct ipv6_sr_hdr),
+				   sizeof(_daddr), &_daddr);
+	WARN_ON(!daddr);
+	if (NF_INVF(ip6info, IP6T_INV_SRCIP,
+		    ipv6_masked_addr_cmp(&ipv6_hdr(skb)->saddr, &ip6info->smsk,
+					 &ip6info->src)) ||
+	    NF_INVF(ip6info, IP6T_INV_DSTIP,
+		    ipv6_masked_addr_cmp(daddr, &ip6info->dmsk,
+					 &ip6info->dst)))
+		return false;
+	return true;
+}
+
+static inline bool
+inner_match(const struct sk_buff *skb, int srhoff,
+	    int innoff, int encap, const struct ip6t_ip6 *ip6info)
+{
+	if (encap)
+		return mt_seg6_encap(skb, innoff, ip6info);
+	return mt_seg6_insert(skb, srhoff, ip6info);
+}
+
+static inline bool
+sr6_pre_processor(const struct sk_buff *skb,
+		  int *innoff, int *srhoff, int *encap)
+{
+	if (ipv6_find_hdr(skb, innoff, IPPROTO_IPV6,
+			  NULL, NULL) == IPPROTO_IPV6){
+		*encap = 1;
+		return true;
+	}
+	if (ipv6_find_hdr(skb, srhoff, IPPROTO_ROUTING,
+			  NULL, NULL) == IPPROTO_ROUTING)
+		return true;
+	return false;
+}
+
 /* Returns whether matches rule or not. */
 /* Performance critical - called for every packet */
 static inline bool
@@ -53,18 +133,25 @@ ip6_packet_match(const struct sk_buff *skb,
 		 const char *outdev,
 		 const struct ip6t_ip6 *ip6info,
 		 unsigned int *protoff,
-		 int *fragoff, bool *hotdrop)
+		 int *fragoff, bool *hotdrop, struct net *net)
 {
 	unsigned long ret;
+	int innoff = 0, srhoff = 0, encap = 0;
 	const struct ipv6hdr *ipv6 = ipv6_hdr(skb);
 
-	if (NF_INVF(ip6info, IP6T_INV_SRCIP,
-		    ipv6_masked_addr_cmp(&ipv6->saddr, &ip6info->smsk,
-					 &ip6info->src)) ||
-	    NF_INVF(ip6info, IP6T_INV_DSTIP,
-		    ipv6_masked_addr_cmp(&ipv6->daddr, &ip6info->dmsk,
-					 &ip6info->dst)))
-		return false;
+	if (!net->ipv6.sysctl.ip6t_seg6 ||
+	    !sr6_pre_processor(skb, &innoff, &srhoff, &encap)) {
+		if (NF_INVF(ip6info, IP6T_INV_SRCIP,
+			    ipv6_masked_addr_cmp(&ipv6->saddr, &ip6info->smsk,
+						 &ip6info->src)) ||
+		    NF_INVF(ip6info, IP6T_INV_DSTIP,
+			    ipv6_masked_addr_cmp(&ipv6->daddr, &ip6info->dmsk,
+						 &ip6info->dst)))
+			return false;
+	} else {
+		if (!inner_match(skb, srhoff, innoff, encap, ip6info))
+			return false;
+	}
 
 	ret = ifname_compare_aligned(indev, ip6info->iniface, ip6info->iniface_mask);
 
@@ -312,7 +399,7 @@ ip6t_do_table(struct sk_buff *skb,
 		WARN_ON(!e);
 		acpar.thoff = 0;
 		if (!ip6_packet_match(skb, indev, outdev, &e->ipv6,
-		    &acpar.thoff, &acpar.fragoff, &acpar.hotdrop)) {
+		    &acpar.thoff, &acpar.fragoff, &acpar.hotdrop, state->net)) {
  no_match:
 			e = ip6t_next_entry(e);
 			continue;
