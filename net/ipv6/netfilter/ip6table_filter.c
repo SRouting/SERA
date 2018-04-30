@@ -12,7 +12,10 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/netfilter_ipv6/ip6_tables.h>
+#include <linux/netfilter_ipv4/ip_tables.h>
 #include <linux/slab.h>
+#include <net/ipv6.h>
+#include <net/ip.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
@@ -33,12 +36,44 @@ static const struct xt_table packet_filter = {
 	.table_init	= ip6table_filter_table_init,
 };
 
+static inline int
+sr6_pre_processor(const struct sk_buff *skb, int *innoff)
+{
+	int ret = 0;
+
+	ret = ipv6_find_hdr(skb, innoff, IPPROTO_IPV6, NULL, NULL);
+	if (ret < 0)
+		ret = ipv6_find_hdr(skb, innoff, IPPROTO_IPIP, NULL, NULL);
+	return ret;
+}
+
 /* The work comes in here from netfilter.c. */
 static unsigned int
 ip6table_filter_hook(void *priv, struct sk_buff *skb,
 		     const struct nf_hook_state *state)
 {
-	return ip6t_do_table(skb, state, state->net->ipv6.ip6table_filter);
+	int innoff = 0, ret = 1, proto;
+
+	if (!state->net->ipv6.sysctl.ip6t_seg6 ||
+	    (proto = sr6_pre_processor(skb, &innoff)) < 0)
+		return ip6t_do_table(skb, state,
+				     state->net->ipv6.ip6table_filter);
+
+	if (!pskb_pull(skb, innoff))
+		return NF_DROP;
+	skb_reset_network_header(skb);
+	switch (proto) {
+	case IPPROTO_IPV6:
+		ret = ip6t_do_table(skb, state,
+				    state->net->ipv6.ip6table_filter);
+		break;
+	case IPPROTO_IPIP:
+		ret = ipt_do_table(skb, state, state->net->ipv4.iptable_filter);
+		break;
+	}
+	skb_push(skb, innoff);
+	skb_reset_network_header(skb);
+	return ret;
 }
 
 static struct nf_hook_ops *filter_ops __read_mostly;
