@@ -99,6 +99,20 @@ config NF_NAT_IPV6
 
 if NF_NAT_IPV6
 
+
+if IPV6_SEG6_LWTUNNEL
+config IP6_NF_TARGET_SEG6
+	tristate 'IPv6 Segment Routing "SEG6" target support'
+	depends on NETFILTER_ADVANCED
+	help
+	 SEG6 is an special target for IPv6 Segment Routing encapsualted
+	 packets. It supports a set of Segment Routing specific actions
+	 that are based on SRH information. It is useful for SRv6 Service
+	 Function chaining use-cases.
+
+	 To compile it as a module, choose M here.  If unsure, say N.
+endif # IPV6_SEG6_LWTUNNEL
+
 config NFT_CHAIN_NAT_IPV6
 	depends on NF_TABLES_IPV6
 	tristate "IPv6 nf_tables nat chain support"
